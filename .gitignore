@@ -1,1 +1,4 @@
 Source Files/
+__pycache__/
+*.pyc
+*.pyo
