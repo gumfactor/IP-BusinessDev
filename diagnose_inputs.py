@@ -55,7 +55,7 @@ def inspect_file(path: Path) -> None:
             # commas (e.g. "HAMILTON, W.") which fool the sniffer into picking comma.
             df = None
             for enc in ("utf-8", "latin-1", "cp1252", "utf-16", "utf-16-le"):
-                for sep, engine in (("|" , "c"), (None, "python")):
+                for sep, engine in (("|", "c"), (None, "python")):
                     try:
                         candidate = pd.read_csv(
                             path,
