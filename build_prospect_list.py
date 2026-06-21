@@ -797,25 +797,34 @@ def consolidate(records: list[dict], fuzzy_threshold: int = 90) -> pd.DataFrame:
     groups = []          # list of dicts: {names:set, norm_names:set, sectors:set, sources:set, count:int}
     norm_to_group = {}   # exact norm_name -> group index
 
-    unique_norms = df["norm_name"].drop_duplicates().tolist()
+    # First-word blocking: partition unique names by their first word, then only
+    # fuzzy-compare names within the same block.  Reduces O(n²) to O(n × avg_block_size).
+    blocks: dict[str, list[str]] = defaultdict(list)
+    for norm in df["norm_name"].drop_duplicates():
+        parts = norm.split()
+        key = parts[0] if parts else norm[:4]
+        blocks[key].append(norm)
 
-    for norm in unique_norms:
-        if norm in norm_to_group:
-            continue
-        best_group_idx = None
-        best_score = 0
-        for idx, g in enumerate(groups):
-            for existing_norm in g["norm_names"]:
-                score = fuzz.token_sort_ratio(norm, existing_norm)
-                if score > best_score:
-                    best_score = score
-                    best_group_idx = idx
-        if best_score >= fuzzy_threshold:
-            groups[best_group_idx]["norm_names"].add(norm)
-            norm_to_group[norm] = best_group_idx
-        else:
-            groups.append({"norm_names": {norm}})
-            norm_to_group[norm] = len(groups) - 1
+    for block_norms in blocks.values():
+        for norm in block_norms:
+            if norm in norm_to_group:
+                continue
+            # Only look at groups that already contain at least one name from this block
+            candidate_idxs = {norm_to_group[n] for n in block_norms if n in norm_to_group}
+            best_group_idx = None
+            best_score = 0
+            for idx in candidate_idxs:
+                for existing_norm in groups[idx]["norm_names"]:
+                    score = fuzz.token_sort_ratio(norm, existing_norm)
+                    if score > best_score:
+                        best_score = score
+                        best_group_idx = idx
+            if best_score >= fuzzy_threshold:
+                groups[best_group_idx]["norm_names"].add(norm)
+                norm_to_group[norm] = best_group_idx
+            else:
+                groups.append({"norm_names": {norm}})
+                norm_to_group[norm] = len(groups) - 1
 
     # Map every row to its group index once, then groupby -- O(n) not O(n × groups)
     df["_group_idx"] = df["norm_name"].map(norm_to_group)
