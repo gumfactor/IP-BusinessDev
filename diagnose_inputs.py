@@ -50,22 +50,32 @@ def inspect_file(path: Path) -> None:
         if ext in (".xlsx", ".xls"):
             df = pd.read_excel(path, nrows=200)
         elif ext in (".csv", ".txt"):
-            # Try a few common encodings
-            for enc in ("utf-8", "latin-1", "cp1252"):
-                try:
-                    df = pd.read_csv(
-                        path,
-                        nrows=200,
-                        encoding=enc,
-                        on_bad_lines="skip",
-                        sep=None,          # auto-detect delimiter
-                        engine="python",
-                    )
+            # Try pipe-delimited first (CIPO IP Horizons format), then auto-detect.
+            # sep=None auto-detection fails on CIPO files because French names contain
+            # commas (e.g. "HAMILTON, W.") which fool the sniffer into picking comma.
+            df = None
+            for enc in ("utf-8", "latin-1", "cp1252", "utf-16", "utf-16-le"):
+                for sep, engine in (("|" , "c"), (None, "python")):
+                    try:
+                        candidate = pd.read_csv(
+                            path,
+                            nrows=200,
+                            encoding=enc,
+                            on_bad_lines="skip",
+                            sep=sep,
+                            engine=engine,
+                        )
+                        # Prefer the parse that gives the most columns
+                        if df is None or len(candidate.columns) > len(df.columns):
+                            df = candidate
+                            if len(df.columns) > 5:
+                                break   # good enough
+                    except (UnicodeDecodeError, Exception):
+                        continue
+                if df is not None and len(df.columns) > 5:
                     break
-                except (UnicodeDecodeError, Exception):
-                    continue
-            else:
-                print("  Could not decode this file with utf-8, latin-1, or cp1252.")
+            if df is None:
+                print("  Could not decode this file with any encoding tried.")
                 return
         else:
             print(f"  Skipping unsupported extension: {ext}")
