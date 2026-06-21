@@ -329,13 +329,12 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
               f"Columns seen: {list(main_df.columns[:8])}")
         return []
 
+    main_df["_pn"] = main_df[pn_col].astype(str).str.strip()
     print(f"[CIPO Patents]   {len(main_df):,} patents in PT_main.")
 
-    # ── Read PT_interested_party ──────────────────────────────────────────────
-    # OWNR rows give us the applicant/owner company name.
-    # AGNT rows give us the IP agent of record.
-    owner_lookup: dict[str, str] = {}
-    agent_lookup: dict[str, str] = {}
+    # ── Read PT_interested_party (vectorized) ─────────────────────────────────
+    owner_s: pd.Series = pd.Series(dtype=str)
+    agent_s: pd.Series = pd.Series(dtype=str)
     agent_data_available = False
 
     if party_path:
@@ -348,28 +347,29 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
 
             if p_pn_col and p_name_col and p_type_col:
                 agent_data_available = True
-                for _, row in party_df.iterrows():
-                    ptype = str(row.get(p_type_col, "")).strip().upper()
-                    pname = str(row.get(p_name_col, "")).strip()
-                    pn    = str(row.get(p_pn_col, "")).strip()
-                    if not pn or not pname or pname in ("nan", "None", ""):
-                        continue
-                    if ptype == "OWNR":
-                        owner_lookup.setdefault(pn, pname)
-                    elif ptype == "AGNT":
-                        agent_lookup.setdefault(pn, pname)
-                print(f"[CIPO Patents]   {len(owner_lookup):,} owners, "
-                      f"{len(agent_lookup):,} agents loaded from PT_interested_party.")
+                party_df["_pn"]   = party_df[p_pn_col].astype(str).str.strip()
+                party_df["_name"] = party_df[p_name_col].astype(str).str.strip()
+                party_df["_type"] = party_df[p_type_col].astype(str).str.strip().str.upper()
+                valid = ~party_df["_name"].isin(["nan", "None", ""])
+                party_df = party_df[valid]
+
+                owner_s = (party_df[party_df["_type"] == "OWNR"]
+                           .drop_duplicates(subset=["_pn"])
+                           .set_index("_pn")["_name"])
+                agent_s = (party_df[party_df["_type"] == "AGNT"]
+                           .drop_duplicates(subset=["_pn"])
+                           .set_index("_pn")["_name"])
+                print(f"[CIPO Patents]   {len(owner_s):,} owners, "
+                      f"{len(agent_s):,} agents loaded from PT_interested_party.")
             else:
                 print(f"[CIPO Patents]   PT_interested_party: could not locate required columns. "
                       f"Columns seen: {list(party_df.columns[:8])}")
     else:
         print("[CIPO Patents]   PT_interested_party not found -- owner/agent data unavailable.")
 
-    # ── Read PT_IPC_classification ────────────────────────────────────────────
+    # ── Read PT_IPC_classification (vectorized) ───────────────────────────────
     # Reconstruct 4-char IPC prefix: Section + zero-padded Class + Subclass
-    # e.g. section="G", class="6", subclass="N" -> "G06N"
-    pn_to_ipc4: dict[str, set[str]] = {}  # patent_number -> set of 4-char IPC prefixes
+    ipc_flat = pd.DataFrame(columns=["_pn", "ipc4"])
 
     if ipc_path:
         print(f"[CIPO Patents]   Reading {ipc_path.name} ...")
@@ -381,77 +381,68 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
             i_sub_col = _find_col_substr(ipc_df, "ipc subclass code")
 
             if i_pn_col and i_sec_col and i_cls_col and i_sub_col:
-                for _, row in ipc_df.iterrows():
-                    pn  = str(row.get(i_pn_col,  "")).strip()
-                    sec = str(row.get(i_sec_col, "")).strip()
-                    cls = str(row.get(i_cls_col, "")).strip()
-                    sub = str(row.get(i_sub_col, "")).strip()
-                    if not (pn and sec and cls and sub):
-                        continue
-                    try:
-                        ipc4 = f"{sec}{int(cls):02d}{sub}".upper()
-                    except ValueError:
-                        continue
-                    pn_to_ipc4.setdefault(pn, set()).add(ipc4)
-                print(f"[CIPO Patents]   {len(pn_to_ipc4):,} patents with IPC codes loaded.")
+                work = ipc_df[[i_pn_col, i_sec_col, i_cls_col, i_sub_col]].copy()
+                work["_pn"] = work[i_pn_col].astype(str).str.strip()
+                work["_cls"] = pd.to_numeric(work[i_cls_col], errors="coerce")
+                work = work.dropna(subset=["_cls"])
+                work["ipc4"] = (
+                    work[i_sec_col].astype(str).str.strip() +
+                    work["_cls"].astype(int).astype(str).str.zfill(2) +
+                    work[i_sub_col].astype(str).str.strip()
+                ).str.upper()
+                ipc_flat = work[["_pn", "ipc4"]].dropna()
+                print(f"[CIPO Patents]   {len(ipc_flat):,} IPC-classification rows loaded.")
             else:
                 print(f"[CIPO Patents]   PT_IPC_classification: could not locate IPC columns. "
                       f"Columns seen: {list(ipc_df.columns[:8])}")
     else:
         print("[CIPO Patents]   PT_IPC_classification not found -- IPC sector filtering unavailable.")
 
-    # ── Match sectors per patent ──────────────────────────────────────────────
-    pn_to_sectors: dict[str, set[str]] = {}
+    # ── Match patents to sectors (vectorized) ─────────────────────────────────
+    sector_frames = []
     for sector in sectors:
-        sdef = SECTOR_DEFINITIONS[sector]
-        prefixes = [p.upper() for p in sdef["ipc_prefixes"]]
-        for pn, ipc4_set in pn_to_ipc4.items():
-            for ipc4 in ipc4_set:
-                if any(ipc4.startswith(p) for p in prefixes):
-                    pn_to_sectors.setdefault(pn, set()).add(sector)
-                    break
+        prefixes = [p.upper() for p in SECTOR_DEFINITIONS[sector]["ipc_prefixes"]]
+        if not ipc_flat.empty:
+            pat = "|".join(f"(?:^{re.escape(p)})" for p in prefixes)
+            mask = ipc_flat["ipc4"].str.match(pat, na=False)
+            matched_pns = ipc_flat.loc[mask, "_pn"].unique()
+            if len(matched_pns):
+                sector_frames.append(pd.DataFrame({"_pn": matched_pns, "sector": sector}))
 
-    # ── Build output records ──────────────────────────────────────────────────
+    # Keyword fallback on English title for patents not caught by IPC
+    if title_col:
+        already = set(pd.concat(sector_frames)["_pn"]) if sector_frames else set()
+        unmatched = main_df[~main_df["_pn"].isin(already)]
+        for sector in sectors:
+            kws = SECTOR_DEFINITIONS[sector]["keywords"]
+            pat = "|".join(re.escape(k) for k in kws)
+            mask = unmatched[title_col].astype(str).str.lower().str.contains(pat, na=False)
+            matched_pns = unmatched.loc[mask, "_pn"].unique()
+            if len(matched_pns):
+                sector_frames.append(pd.DataFrame({"_pn": matched_pns, "sector": sector}))
+
+    if not sector_frames:
+        print("[CIPO Patents] 0 sector-matching records found.")
+        return []
+
+    sector_df = pd.concat(sector_frames).drop_duplicates()
+    sector_df["owner_name"] = sector_df["_pn"].map(owner_s)
+    sector_df["agent_name"] = sector_df["_pn"].map(agent_s)
+    sector_df = sector_df.dropna(subset=["owner_name"])
+
     records = []
-    for _, row in main_df.iterrows():
-        pn = str(row.get(pn_col, "")).strip()
-        if not pn:
-            continue
-
-        matched_sectors = set(pn_to_sectors.get(pn, set()))
-
-        # Keyword fallback against English title when IPC gives no match
-        if title_col:
-            title_val = str(row.get(title_col, ""))
-            for sector in sectors:
-                if sector not in matched_sectors:
-                    if matches_sector(title_val, SECTOR_DEFINITIONS[sector]["keywords"]):
-                        matched_sectors.add(sector)
-
-        if not matched_sectors:
-            continue
-
-        owner_name = owner_lookup.get(pn)
-        agent_name = agent_lookup.get(pn)
-
-        if not owner_name:
-            continue  # no owner record means we have nothing to prospect
-
-        if agent_name:
-            agent_status = "represented"
-        elif agent_data_available:
-            agent_status = "self"
-        else:
-            agent_status = "unknown"
-
-        for sector in sorted(matched_sectors):
-            records.append({
-                "name": owner_name,
-                "sector": sector,
-                "source": "CIPO Patents (IP Horizons)",
-                "agent": agent_name,
-                "agent_status": agent_status,
-            })
+    for _, row in sector_df.iterrows():
+        agent_name = row["agent_name"] if pd.notna(row.get("agent_name")) else None
+        agent_status = ("represented" if agent_name
+                        else "self" if agent_data_available
+                        else "unknown")
+        records.append({
+            "name": row["owner_name"],
+            "sector": row["sector"],
+            "source": "CIPO Patents (IP Horizons)",
+            "agent": agent_name,
+            "agent_status": agent_status,
+        })
 
     print(f"[CIPO Patents] {len(records)} sector-matching records found.")
     return records
@@ -493,22 +484,23 @@ def load_cipo_trademarks(trademark_dir: str, sectors: list[str]) -> list[dict]:
         print("[CIPO Trademarks] Failed to read TM_application_main file.")
         return []
 
-    app_col   = _find_col_substr(main_df, "application number")
-    nice_col  = _find_col_substr(main_df, "nice classification code", "nice class")
-    text_col  = _find_col_substr(main_df, "mark description", "description", "title")
+    app_col  = _find_col_substr(main_df, "application number")
+    nice_col = _find_col_substr(main_df, "nice classification code", "nice class")
+    text_col = _find_col_substr(main_df, "mark description", "description", "title")
 
     if not app_col:
         print(f"[CIPO Trademarks] Could not find application-number column. "
               f"Columns seen: {list(main_df.columns[:8])}")
         return []
 
+    main_df["_app"] = main_df[app_col].astype(str).str.strip()
     print(f"[CIPO Trademarks]   {len(main_df):,} applications in TM_application_main.")
 
-    # ── Read TM_interested_party ──────────────────────────────────────────────
-    # Party Type Code 10 = current owner/registrant (the prospecting target).
-    # Current Owner Legal Name column is also available and preferred where not "Unknown".
-    owner_lookup: dict[str, str] = {}
-    agent_lookup: dict[str, str] = {}
+    # ── Read TM_interested_party (vectorized) ─────────────────────────────────
+    # Current Owner Legal Name is preferred; Party Name is the fallback.
+    # Agent Number present and != -1 means represented.
+    owner_s: pd.Series = pd.Series(dtype=str)
+    agent_s: pd.Series = pd.Series(dtype=str)
     agent_data_available = False
 
     if party_path:
@@ -518,84 +510,89 @@ def load_cipo_trademarks(trademark_dir: str, sectors: list[str]) -> list[dict]:
             p_app_col   = _find_col_substr(party_df, "application number")
             p_name_col  = _find_col_substr(party_df, "party name")
             p_owner_col = _find_col_substr(party_df, "current owner legal name")
-            p_type_col  = _find_col_substr(party_df, "party type code")
             p_agent_col = _find_col_substr(party_df, "agent number")
 
             if p_app_col and (p_name_col or p_owner_col):
                 agent_data_available = True
-                for _, row in party_df.iterrows():
-                    app_no = str(row.get(p_app_col, "")).strip()
-                    if not app_no:
-                        continue
-                    ptype = str(row.get(p_type_col, "")).strip() if p_type_col else ""
+                party_df["_app"] = party_df[p_app_col].astype(str).str.strip()
 
-                    # Prefer Current Owner Legal Name; fall back to Party Name
-                    owner_name = None
-                    if p_owner_col:
-                        val = str(row.get(p_owner_col, "")).strip()
-                        if val and val not in ("nan", "None", "Unknown", "-1"):
-                            owner_name = val
-                    if not owner_name and p_name_col:
-                        val = str(row.get(p_name_col, "")).strip()
-                        if val and val not in ("nan", "None", ""):
-                            owner_name = val
+                # Build owner Series: prefer Current Owner Legal Name, fall back to Party Name
+                bad = {"nan", "None", "Unknown", "-1", ""}
+                if p_owner_col:
+                    owner_raw = party_df[["_app", p_owner_col]].copy()
+                    owner_raw[p_owner_col] = owner_raw[p_owner_col].astype(str).str.strip()
+                    owner_raw = owner_raw[~owner_raw[p_owner_col].isin(bad)]
+                    owner_s = (owner_raw.drop_duplicates(subset=["_app"])
+                               .set_index("_app")[p_owner_col])
 
-                    if owner_name:
-                        owner_lookup.setdefault(app_no, owner_name)
+                if p_name_col:
+                    name_raw = party_df[["_app", p_name_col]].copy()
+                    name_raw[p_name_col] = name_raw[p_name_col].astype(str).str.strip()
+                    name_raw = name_raw[~name_raw[p_name_col].isin(bad - {"Unknown"})]
+                    name_s = (name_raw.drop_duplicates(subset=["_app"])
+                              .set_index("_app")[p_name_col])
+                    owner_s = owner_s.combine_first(name_s)
 
-                    # Agent number present and valid means represented
-                    if p_agent_col:
-                        agent_val = str(row.get(p_agent_col, "")).strip()
-                        if agent_val and agent_val not in ("-1", "nan", "None", ""):
-                            agent_lookup.setdefault(app_no, f"Agent #{agent_val}")
+                if p_agent_col:
+                    agent_raw = party_df[["_app", p_agent_col]].copy()
+                    agent_raw[p_agent_col] = agent_raw[p_agent_col].astype(str).str.strip()
+                    agent_raw = agent_raw[~agent_raw[p_agent_col].isin({"-1", "nan", "None", ""})]
+                    agent_raw[p_agent_col] = "Agent #" + agent_raw[p_agent_col]
+                    agent_s = (agent_raw.drop_duplicates(subset=["_app"])
+                               .set_index("_app")[p_agent_col])
 
-                print(f"[CIPO Trademarks]   {len(owner_lookup):,} owners, "
-                      f"{len(agent_lookup):,} agent records loaded.")
+                print(f"[CIPO Trademarks]   {len(owner_s):,} owners, "
+                      f"{len(agent_s):,} agent records loaded.")
             else:
                 print(f"[CIPO Trademarks]   TM_interested_party: could not locate required columns. "
                       f"Columns seen: {list(party_df.columns[:8])}")
     else:
         print("[CIPO Trademarks]   TM_interested_party not found -- owner/agent data unavailable.")
 
-    # ── Build output records ──────────────────────────────────────────────────
+    # ── Match applications to sectors (vectorized) ────────────────────────────
+    sector_frames = []
+    for sector in sectors:
+        sdef = SECTOR_DEFINITIONS[sector]
+
+        nice_mask = pd.Series(False, index=main_df.index)
+        if nice_col:
+            nice_vals = main_df[nice_col].astype(str)
+            valid_nice = ~nice_vals.isin(["-1", "nan", "None"])
+            for nc in sdef["nice_classes"]:
+                nice_mask |= valid_nice & nice_vals.str.contains(str(nc), regex=False, na=False)
+
+        kw_mask = pd.Series(False, index=main_df.index)
+        if text_col and sdef["keywords"]:
+            pat = "|".join(re.escape(k) for k in sdef["keywords"])
+            kw_mask = main_df[text_col].astype(str).str.lower().str.contains(pat, na=False)
+
+        combined = nice_mask | kw_mask
+        if combined.any():
+            matched_apps = main_df.loc[combined, "_app"].unique()
+            sector_frames.append(pd.DataFrame({"_app": matched_apps, "sector": sector}))
+
+    if not sector_frames:
+        print("[CIPO Trademarks] 0 sector-matching records found.")
+        return []
+
+    sector_df = pd.concat(sector_frames).drop_duplicates()
+    sector_df["owner_name"] = sector_df["_app"].map(owner_s)
+    sector_df["agent_name"] = sector_df["_app"].map(agent_s)
+    sector_df = sector_df.dropna(subset=["owner_name"])
+
     records = []
-    for _, row in main_df.iterrows():
-        app_no = str(row.get(app_col, "")).strip()
-        if not app_no:
-            continue
-
-        owner_name = owner_lookup.get(app_no)
-        if not owner_name:
-            continue
-
-        nice_val = str(row.get(nice_col, "")) if nice_col else ""
-        text_val = str(row.get(text_col, "")) if text_col else ""
-        agent_name = agent_lookup.get(app_no)
-
-        if agent_name:
-            agent_status = "represented"
-        elif agent_data_available:
-            agent_status = "self"
-        else:
-            agent_status = "unknown"
-
-        for sector in sectors:
-            sdef = SECTOR_DEFINITIONS[sector]
-            nice_hit = False
-            if nice_val and nice_val not in ("-1", "nan", "None"):
-                for nc in sdef["nice_classes"]:
-                    if str(nc) in re.findall(r"\d+", nice_val):
-                        nice_hit = True
-                        break
-            kw_hit = matches_sector(text_val, sdef["keywords"])
-            if nice_hit or kw_hit:
-                records.append({
-                    "name": owner_name,
-                    "sector": sector,
-                    "source": "CIPO Trademarks (IP Horizons)",
-                    "agent": agent_name,
-                    "agent_status": agent_status,
-                })
+    for _, row in sector_df.iterrows():
+        agent_name = row["agent_name"] if pd.notna(row.get("agent_name")) else None
+        agent_status = ("represented" if agent_name
+                        else "self" if agent_data_available
+                        else "unknown")
+        records.append({
+            "name": row["owner_name"],
+            "sector": row["sector"],
+            "source": "CIPO Trademarks (IP Horizons)",
+            "agent": agent_name,
+            "agent_status": agent_status,
+        })
 
     print(f"[CIPO Trademarks] {len(records)} sector-matching records found.")
     return records
