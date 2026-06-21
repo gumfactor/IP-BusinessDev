@@ -231,8 +231,13 @@ def _find_col_substr(df: pd.DataFrame, *substrings: str) -> str | None:
 
 
 def _read_pipe_csv(path: Path) -> pd.DataFrame | None:
-    """Read a CIPO pipe-delimited CSV trying multiple encodings."""
-    for enc in ("utf-8", "latin-1", "cp1252", "utf-16", "utf-16-le"):
+    """Read a CIPO pipe-delimited CSV trying multiple encodings.
+
+    latin-1 is tried first: CIPO patent files use it (French accents cause
+    strict utf-8 to fail and re-read the whole file before giving up).
+    utf-16 variants come last as they're only needed for TM_interested_party.
+    """
+    for enc in ("latin-1", "utf-8", "cp1252", "utf-16", "utf-16-le"):
         try:
             df = pd.read_csv(path, sep="|", encoding=enc, low_memory=False, on_bad_lines="skip")
             if len(df.columns) > 1:
