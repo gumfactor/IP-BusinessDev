@@ -337,14 +337,21 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
         print("[CIPO Patents] Failed to read PT_main file.")
         return []
 
-    pn_col    = _find_col_substr(main_df, "patent number")
-    title_col = _find_col_substr(main_df, "title english", "english title")
+    pn_col = (_find_col_substr(main_df, "patent number") or
+               _find_col_substr(main_df, "application number") or
+               _find_col_substr(main_df, "appl number"))
+    title_col = (_find_col_substr(main_df, "title english", "english title") or
+                 _find_col_substr(main_df, "invention title") or
+                 _find_col_substr(main_df, "title") or
+                 _find_col_substr(main_df, "abstract") or
+                 _find_col_substr(main_df, "description"))
 
     if not pn_col:
         print(f"[CIPO Patents] Could not find patent-number column. "
-              f"Columns seen: {list(main_df.columns[:8])}")
+              f"All columns: {list(main_df.columns)}")
         return []
 
+    print(f"[CIPO Patents]   Key column: {pn_col!r}  Title column: {title_col!r}")
     main_df["_pn"] = main_df[pn_col].astype(str).str.strip()
     print(f"[CIPO Patents]   {len(main_df):,} patents in PT_main.")
 
@@ -357,9 +364,20 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
         print(f"[CIPO Patents]   Reading {party_path.name} ...")
         party_df = _read_pipe_csv(party_path)
         if party_df is not None:
-            p_pn_col   = _find_col_substr(party_df, "patent number")
-            p_name_col = _find_col_substr(party_df, "party name")
-            p_type_col = _find_col_substr(party_df, "interested party type code", "type code")
+            # Most specific search first to avoid grabbing a wrong "type code" column
+            p_pn_col   = (_find_col_substr(party_df, "patent number") or
+                           _find_col_substr(party_df, "application number"))
+            p_name_col = (_find_col_substr(party_df, "interested party name") or
+                           _find_col_substr(party_df, "party name") or
+                           _find_col_substr(party_df, "applicant name") or
+                           _find_col_substr(party_df, "name"))
+            p_type_col = (_find_col_substr(party_df, "interested party type code") or
+                           _find_col_substr(party_df, "interested party type") or
+                           _find_col_substr(party_df, "party type code") or
+                           _find_col_substr(party_df, "party type") or
+                           _find_col_substr(party_df, "type code"))
+
+            print(f"[CIPO Patents]   party key={p_pn_col!r}  name={p_name_col!r}  type={p_type_col!r}")
 
             if p_pn_col and p_name_col and p_type_col:
                 agent_data_available = True
@@ -369,17 +387,24 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
                 valid = ~party_df["_name"].isin(["nan", "None", ""])
                 party_df = party_df[valid]
 
-                owner_s = (party_df[party_df["_type"] == "OWNR"]
+                # Show what type codes exist so mismatches are obvious
+                type_counts = party_df["_type"].value_counts().head(10)
+                print(f"[CIPO Patents]   Type codes found: {type_counts.to_dict()}")
+
+                # Accept OWNR and common variants; same for AGNT
+                owner_codes = {"OWNR", "OWNER", "OWN", "OWR", "PROP", "PROPRIETAIRE"}
+                agent_codes = {"AGNT", "AGENT", "AGT", "AGN", "REP", "REPRESENTATIVE"}
+                owner_s = (party_df[party_df["_type"].isin(owner_codes)]
                            .drop_duplicates(subset=["_pn"])
                            .set_index("_pn")["_name"])
-                agent_s = (party_df[party_df["_type"] == "AGNT"]
+                agent_s = (party_df[party_df["_type"].isin(agent_codes)]
                            .drop_duplicates(subset=["_pn"])
                            .set_index("_pn")["_name"])
                 print(f"[CIPO Patents]   {len(owner_s):,} owners, "
                       f"{len(agent_s):,} agents loaded from PT_interested_party.")
             else:
                 print(f"[CIPO Patents]   PT_interested_party: could not locate required columns. "
-                      f"Columns seen: {list(party_df.columns[:8])}")
+                      f"All columns: {list(party_df.columns)}")
     else:
         print("[CIPO Patents]   PT_interested_party not found -- owner/agent data unavailable.")
 
@@ -391,10 +416,22 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
         print(f"[CIPO Patents]   Reading {ipc_path.name} ...")
         ipc_df = _read_pipe_csv(ipc_path)
         if ipc_df is not None:
-            i_pn_col  = _find_col_substr(ipc_df, "patent number")
-            i_sec_col = _find_col_substr(ipc_df, "ipc section code")
-            i_cls_col = _find_col_substr(ipc_df, "ipc class code")
-            i_sub_col = _find_col_substr(ipc_df, "ipc subclass code")
+            i_pn_col  = (_find_col_substr(ipc_df, "patent number") or
+                          _find_col_substr(ipc_df, "application number"))
+            i_sec_col = (_find_col_substr(ipc_df, "ipc section code") or
+                          _find_col_substr(ipc_df, "ipc section") or
+                          _find_col_substr(ipc_df, "section code") or
+                          _find_col_substr(ipc_df, "section"))
+            i_cls_col = (_find_col_substr(ipc_df, "ipc class code") or
+                          _find_col_substr(ipc_df, "ipc class") or
+                          _find_col_substr(ipc_df, "class code"))
+            i_sub_col = (_find_col_substr(ipc_df, "ipc subclass code") or
+                          _find_col_substr(ipc_df, "ipc subclass") or
+                          _find_col_substr(ipc_df, "subclass code") or
+                          _find_col_substr(ipc_df, "subclass"))
+
+            print(f"[CIPO Patents]   IPC cols: pn={i_pn_col!r} sec={i_sec_col!r} "
+                  f"cls={i_cls_col!r} sub={i_sub_col!r}")
 
             if i_pn_col and i_sec_col and i_cls_col and i_sub_col:
                 work = ipc_df[[i_pn_col, i_sec_col, i_cls_col, i_sub_col]].copy()
@@ -407,10 +444,11 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
                     work[i_sub_col].astype(str).str.strip()
                 ).str.upper()
                 ipc_flat = work[["_pn", "ipc4"]].dropna()
-                print(f"[CIPO Patents]   {len(ipc_flat):,} IPC-classification rows loaded.")
+                print(f"[CIPO Patents]   {len(ipc_flat):,} IPC-classification rows loaded. "
+                      f"Sample codes: {ipc_flat['ipc4'].value_counts().head(5).index.tolist()}")
             else:
                 print(f"[CIPO Patents]   PT_IPC_classification: could not locate IPC columns. "
-                      f"Columns seen: {list(ipc_df.columns[:8])}")
+                      f"All columns: {list(ipc_df.columns)}")
     else:
         print("[CIPO Patents]   PT_IPC_classification not found -- IPC sector filtering unavailable.")
 
