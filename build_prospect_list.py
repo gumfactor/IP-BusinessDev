@@ -97,7 +97,6 @@ from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
-import requests
 from rapidfuzz import fuzz
 
 # --------------------------------------------------------------------------
@@ -233,11 +232,22 @@ def _find_col_substr(df: pd.DataFrame, *substrings: str) -> str | None:
 def _read_pipe_csv(path: Path) -> pd.DataFrame | None:
     """Read a CIPO pipe-delimited CSV trying multiple encodings.
 
-    latin-1 is tried first: CIPO patent files use it (French accents cause
-    strict utf-8 to fail and re-read the whole file before giving up).
-    utf-16 variants come last as they're only needed for TM_interested_party.
+    Peeks at the first 2 bytes first: if a UTF-16 BOM is present (TM_interested_party
+    is 714 MB UTF-16) we jump straight to utf-16 rather than letting latin-1 silently
+    read the whole file as garbage.  For all other files latin-1 is tried first
+    because CIPO patent files use it for French accents.
     """
-    for enc in ("latin-1", "utf-8", "cp1252", "utf-16", "utf-16-le"):
+    try:
+        with open(path, "rb") as fh:
+            bom = fh.read(2)
+        if bom in (b"\xff\xfe", b"\xfe\xff"):
+            df = pd.read_csv(path, sep="|", encoding="utf-16", low_memory=False, on_bad_lines="skip")
+            if len(df.columns) > 1:
+                return df
+    except Exception:
+        pass
+
+    for enc in ("latin-1", "utf-8", "cp1252"):
         try:
             df = pd.read_csv(path, sep="|", encoding=enc, low_memory=False, on_bad_lines="skip")
             if len(df.columns) > 1:
@@ -478,6 +488,7 @@ def load_cipo_trademarks(trademark_dir: str, sectors: list[str]) -> list[dict]:
 
     main_path  = find_file("TM_application_main*.csv", "tm_application_main*.csv")
     party_path = find_file("TM_interested_party*.csv", "tm_interested_party*.csv")
+    class_path = find_file("TM_applicant_classification*.csv", "tm_applicant_classification*.csv")
 
     if not main_path:
         print("[CIPO Trademarks] Could not find TM_application_main*.csv in the given directory.")
@@ -501,6 +512,32 @@ def load_cipo_trademarks(trademark_dir: str, sectors: list[str]) -> list[dict]:
 
     main_df["_app"] = main_df[app_col].astype(str).str.strip()
     print(f"[CIPO Trademarks]   {len(main_df):,} applications in TM_application_main.")
+
+    # ── Supplement Nice classes from TM_applicant_classification if needed ────
+    # Nice class may not be in TM_application_main; CIPO also ships a separate
+    # TM_applicant_classification.csv with one row per (application, Nice class).
+    if nice_col is None and class_path:
+        print(f"[CIPO Trademarks]   No Nice class column in main; trying {class_path.name} ...")
+        class_df = _read_pipe_csv(class_path)
+        if class_df is not None:
+            c_app_col  = _find_col_substr(class_df, "application number")
+            c_nice_col = _find_col_substr(class_df, "nice", "classification", "class")
+            if c_app_col and c_nice_col:
+                nice_agg = (class_df[[c_app_col, c_nice_col]]
+                            .dropna(subset=[c_nice_col])
+                            .groupby(c_app_col)[c_nice_col]
+                            .apply(lambda vals: " ".join(vals.astype(str)))
+                            .reset_index()
+                            .rename(columns={c_app_col: "_app_cls", c_nice_col: "_nice_joined"}))
+                nice_agg["_app_cls"] = nice_agg["_app_cls"].astype(str).str.strip()
+                main_df = main_df.merge(nice_agg, left_on="_app", right_on="_app_cls", how="left")
+                main_df.drop(columns=["_app_cls"], inplace=True, errors="ignore")
+                nice_col = "_nice_joined"
+                print(f"[CIPO Trademarks]   Loaded Nice classes from {class_path.name} "
+                      f"({len(nice_agg):,} application entries).")
+            else:
+                print(f"[CIPO Trademarks]   {class_path.name}: could not locate app-number/Nice columns. "
+                      f"Columns seen: {list(class_df.columns[:8])}")
 
     # ── Read TM_interested_party (vectorized) ─────────────────────────────────
     # Current Owner Legal Name is preferred; Party Name is the fallback.
@@ -565,7 +602,8 @@ def load_cipo_trademarks(trademark_dir: str, sectors: list[str]) -> list[dict]:
             nice_vals = main_df[nice_col].astype(str)
             valid_nice = ~nice_vals.isin(["-1", "nan", "None"])
             for nc in sdef["nice_classes"]:
-                nice_mask |= valid_nice & nice_vals.str.contains(str(nc), regex=False, na=False)
+                # Use word-boundary regex so class "9" doesn't match "19", "29", etc.
+                nice_mask |= valid_nice & nice_vals.str.contains(rf"\b{nc}\b", regex=True, na=False)
 
         kw_mask = pd.Series(False, index=main_df.index)
         if text_col and sdef["keywords"]:
@@ -678,6 +716,7 @@ def fetch_tsx_listed_companies(tsx_file: str | None, sectors: list[str]) -> list
     if not tsx_file:
         print("[TSX Listings] No --tsx-file given, attempting direct download...")
         try:
+            import requests
             resp = requests.get(TMX_STATS_PAGE, timeout=15)
             resp.raise_for_status()
             print("[TSX Listings] Could not auto-locate the download link from the page "
@@ -700,9 +739,8 @@ def fetch_tsx_listed_companies(tsx_file: str | None, sectors: list[str]) -> list
             probe = pd.read_excel(tsx_path, header=None, nrows=10)
             header_row = 3  # safe default
             for i, row in probe.iterrows():
-                first_val = str(row.dropna().iloc[0]).strip() if not row.dropna().empty else ""
-                # The real header row has short token-like values (Co_ID, Exchange, etc.)
-                if first_val and len(first_val) <= 20 and not first_val.startswith("This") and not first_val.startswith("#"):
+                # The real header row contains "Co_ID" (TMX's company identifier column)
+                if row.astype(str).str.contains("Co_ID", case=False, na=False).any():
                     header_row = int(i)
                     break
             df = pd.read_excel(tsx_path, header=header_row)
@@ -779,10 +817,11 @@ def consolidate(records: list[dict], fuzzy_threshold: int = 90) -> pd.DataFrame:
             groups.append({"norm_names": {norm}})
             norm_to_group[norm] = len(groups) - 1
 
+    # Map every row to its group index once, then groupby -- O(n) not O(n × groups)
+    df["_group_idx"] = df["norm_name"].map(norm_to_group)
+
     rows = []
-    for idx in range(len(groups)):
-        norms_in_group = groups[idx]["norm_names"]
-        sub = df[df["norm_name"].isin(norms_in_group)]
+    for idx, sub in df.groupby("_group_idx"):
         display_name = sub["name"].value_counts().idxmax()
         name_variants = sorted(set(sub["name"]) - {display_name})
         sectors_found = sorted(set(sub["sector"]))
