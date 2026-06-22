@@ -364,9 +364,15 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
         print(f"[CIPO Patents]   Reading {party_path.name} ...")
         party_df = _read_pipe_csv(party_path)
         if party_df is not None:
-            # Most specific search first to avoid grabbing a wrong "type code" column
-            p_pn_col   = (_find_col_substr(party_df, "patent number") or
-                           _find_col_substr(party_df, "application number"))
+            # Most specific search first to avoid grabbing a wrong "type code" column.
+            # Match the key type PT_main used (patent vs application number) so the
+            # join doesn't silently cross identifier spaces.
+            if "patent" in pn_col.lower():
+                p_pn_col = (_find_col_substr(party_df, "patent number") or
+                             _find_col_substr(party_df, "application number"))
+            else:
+                p_pn_col = (_find_col_substr(party_df, "application number") or
+                             _find_col_substr(party_df, "patent number"))
             p_name_col = (_find_col_substr(party_df, "interested party name") or
                            _find_col_substr(party_df, "party name") or
                            _find_col_substr(party_df, "applicant name") or
@@ -378,9 +384,15 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
                            _find_col_substr(party_df, "type code"))
 
             print(f"[CIPO Patents]   party key={p_pn_col!r}  name={p_name_col!r}  type={p_type_col!r}")
+            if p_pn_col and pn_col:
+                pt_key = "patent" in pn_col.lower()
+                party_key = "patent" in p_pn_col.lower()
+                if pt_key != party_key:
+                    print(f"[CIPO Patents]   WARNING: PT_main key {pn_col!r} and "
+                          f"PT_interested_party key {p_pn_col!r} are different identifier "
+                          f"spaces -- the join will produce 0 matches.")
 
             if p_pn_col and p_name_col and p_type_col:
-                agent_data_available = True
                 party_df["_pn"]   = party_df[p_pn_col].astype(str).str.strip()
                 party_df["_name"] = party_df[p_name_col].astype(str).str.strip()
                 party_df["_type"] = party_df[p_type_col].astype(str).str.strip().str.upper()
@@ -402,6 +414,14 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
                            .set_index("_pn")["_name"])
                 print(f"[CIPO Patents]   {len(owner_s):,} owners, "
                       f"{len(agent_s):,} agents loaded from PT_interested_party.")
+                # Only declare agent data usable when type codes actually matched;
+                # 0 owners + 0 agents means unrecognized codes → report "unknown",
+                # not "self-filer" (which is the highest-value BD signal).
+                agent_data_available = len(owner_s) > 0 or len(agent_s) > 0
+                if not agent_data_available:
+                    print("[CIPO Patents]   WARNING: 0 owners and 0 agents found -- "
+                          "none of the type codes matched expected owner/agent codes. "
+                          "Filing status will be 'unknown'. Check type codes above.")
             else:
                 print(f"[CIPO Patents]   PT_interested_party: could not locate required columns. "
                       f"All columns: {list(party_df.columns)}")
@@ -423,8 +443,10 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
                           _find_col_substr(ipc_df, "section code") or
                           _find_col_substr(ipc_df, "section"))
             i_cls_col = (_find_col_substr(ipc_df, "ipc class code") or
-                          _find_col_substr(ipc_df, "ipc class") or
-                          _find_col_substr(ipc_df, "class code"))
+                          _find_col_substr(ipc_df, "ipc class"))
+            # NOTE: do NOT fall back to bare "class code" -- it is a substring of
+            # "Subclass Code", which would assign the subclass letter to i_cls_col
+            # and make pd.to_numeric return all NaN, emptying ipc_flat.
             i_sub_col = (_find_col_substr(ipc_df, "ipc subclass code") or
                           _find_col_substr(ipc_df, "ipc subclass") or
                           _find_col_substr(ipc_df, "subclass code") or
@@ -559,7 +581,10 @@ def load_cipo_trademarks(trademark_dir: str, sectors: list[str]) -> list[dict]:
         class_df = _read_pipe_csv(class_path)
         if class_df is not None:
             c_app_col  = _find_col_substr(class_df, "application number")
-            c_nice_col = _find_col_substr(class_df, "nice", "classification", "class")
+            c_nice_col = (_find_col_substr(class_df, "nice class") or
+                           _find_col_substr(class_df, "nice") or
+                           _find_col_substr(class_df, "class code") or
+                           _find_col_substr(class_df, "class number"))
             if c_app_col and c_nice_col:
                 nice_agg = (class_df[[c_app_col, c_nice_col]]
                             .dropna(subset=[c_nice_col])
@@ -594,7 +619,6 @@ def load_cipo_trademarks(trademark_dir: str, sectors: list[str]) -> list[dict]:
             p_agent_col = _find_col_substr(party_df, "agent number")
 
             if p_app_col and (p_name_col or p_owner_col):
-                agent_data_available = True
                 party_df["_app"] = party_df[p_app_col].astype(str).str.strip()
 
                 # Build owner Series: prefer Current Owner Legal Name, fall back to Party Name
@@ -622,6 +646,7 @@ def load_cipo_trademarks(trademark_dir: str, sectors: list[str]) -> list[dict]:
                     agent_s = (agent_raw.drop_duplicates(subset=["_app"])
                                .set_index("_app")[p_agent_col])
 
+                agent_data_available = len(owner_s) > 0 or len(agent_s) > 0
                 print(f"[CIPO Trademarks]   {len(owner_s):,} owners, "
                       f"{len(agent_s):,} agent records loaded.")
             else:
@@ -640,8 +665,9 @@ def load_cipo_trademarks(trademark_dir: str, sectors: list[str]) -> list[dict]:
             nice_vals = main_df[nice_col].astype(str)
             valid_nice = ~nice_vals.isin(["-1", "nan", "None"])
             for nc in sdef["nice_classes"]:
-                # Use word-boundary regex so class "9" doesn't match "19", "29", etc.
-                nice_mask |= valid_nice & nice_vals.str.contains(rf"\b{nc}\b", regex=True, na=False)
+                # \b0*{nc}\b matches "9", "09", "009" but not "19"/"29"/etc.
+                # The 0* handles zero-padded storage ("009") as well as plain ("9").
+                nice_mask |= valid_nice & nice_vals.str.contains(rf"\b0*{nc}\b", regex=True, na=False)
 
         kw_mask = pd.Series(False, index=main_df.index)
         if text_col and sdef["keywords"]:
@@ -808,6 +834,8 @@ def fetch_tsx_listed_companies(tsx_file: str | None, sectors: list[str]) -> list
                 records.append({"name": name.strip(), "sector": sector,
                                  "source": "TSX/TSXV Listings",
                                  "agent": None, "agent_status": "n/a"})
+                break  # TSX sectors are broad; avoid tagging one company with both
+                       # "ai" and "cybersecurity" just because both map to "Technology"
     print(f"[TSX Listings] {len(records)} sector-matching records found.")
     return records
 
@@ -835,15 +863,19 @@ def consolidate(records: list[dict], fuzzy_threshold: int = 90) -> pd.DataFrame:
     groups = []          # list of dicts: {names:set, norm_names:set, sectors:set, sources:set, count:int}
     norm_to_group = {}   # exact norm_name -> group index
 
-    # First-word blocking: partition unique names by their first word, then only
-    # fuzzy-compare names within the same block.  Reduces O(n²) to O(n × avg_block_size).
-    blocks: dict[str, list[str]] = defaultdict(list)
+    # First+last-word blocking: index each name under both its first and last word so
+    # that "Acme Technologies" and "Technologies Acme" (bilingual inversions common in
+    # CIPO data) land in the same block and get fuzzy-compared.
+    blocks: dict[str, set[str]] = defaultdict(set)
     for norm in df["norm_name"].drop_duplicates():
         parts = norm.split()
-        key = parts[0] if parts else norm[:4]
-        blocks[key].append(norm)
+        first = parts[0] if parts else norm[:4]
+        blocks[first].add(norm)
+        if len(parts) > 1:
+            blocks[parts[-1]].add(norm)
 
-    for block_norms in blocks.values():
+    for block_norms_set in blocks.values():
+        block_norms = list(block_norms_set)
         for norm in block_norms:
             if norm in norm_to_group:
                 continue
