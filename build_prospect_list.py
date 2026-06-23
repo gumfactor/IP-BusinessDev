@@ -229,19 +229,24 @@ def _find_col_substr(df: pd.DataFrame, *substrings: str) -> str | None:
     return None
 
 
-def _read_pipe_csv(path: Path) -> pd.DataFrame | None:
+def _read_pipe_csv(path: Path, nrows: int | None = None) -> pd.DataFrame | None:
     """Read a CIPO pipe-delimited CSV trying multiple encodings.
 
     Peeks at the first 2 bytes first: if a UTF-16 BOM is present (TM_interested_party
     is 714 MB UTF-16) we jump straight to utf-16 rather than letting latin-1 silently
     read the whole file as garbage.  For all other files latin-1 is tried first
     because CIPO patent files use it for French accents.
+
+    nrows: if set, read only the first N data rows (for fast test runs).
     """
+    kw = dict(sep="|", low_memory=False, on_bad_lines="skip")
+    if nrows is not None:
+        kw["nrows"] = nrows
     try:
         with open(path, "rb") as fh:
             bom = fh.read(2)
         if bom in (b"\xff\xfe", b"\xfe\xff"):
-            df = pd.read_csv(path, sep="|", encoding="utf-16", low_memory=False, on_bad_lines="skip")
+            df = pd.read_csv(path, encoding="utf-16", **kw)
             if len(df.columns) > 1:
                 return df
     except Exception:
@@ -249,7 +254,7 @@ def _read_pipe_csv(path: Path) -> pd.DataFrame | None:
 
     for enc in ("latin-1", "utf-8", "cp1252"):
         try:
-            df = pd.read_csv(path, sep="|", encoding=enc, low_memory=False, on_bad_lines="skip")
+            df = pd.read_csv(path, encoding=enc, **kw)
             if len(df.columns) > 1:
                 return df
         except Exception:
@@ -297,7 +302,7 @@ def matches_tsx_category(sector_val: str, sector_keywords: list[str]) -> bool:
 # Each returns a list of dicts: {"name": str, "sector": str, "source": str}
 # --------------------------------------------------------------------------
 
-def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
+def load_cipo_patents(patent_dir: str, sectors: list[str], nrows: int | None = None) -> list[dict]:
     """
     Loads CIPO IP Horizons bulk patent data from a directory containing:
       PT_main*.csv               – patent metadata (title, status, filing date)
@@ -334,7 +339,7 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
 
     # ── Read PT_main ──────────────────────────────────────────────────────────
     print(f"[CIPO Patents]   Reading {main_path.name} ...")
-    main_df = _read_pipe_csv(main_path)
+    main_df = _read_pipe_csv(main_path, nrows=nrows)
     if main_df is None or main_df.empty:
         print("[CIPO Patents] Failed to read PT_main file.")
         return []
@@ -372,7 +377,7 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
 
     if party_path:
         print(f"[CIPO Patents]   Reading {party_path.name} ...")
-        party_df = _read_pipe_csv(party_path)
+        party_df = _read_pipe_csv(party_path, nrows=nrows)
         if party_df is not None:
             # Most specific search first to avoid grabbing a wrong "type code" column.
             # Match the key type PT_main used (patent vs application number) so the
@@ -445,7 +450,7 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
 
     if ipc_path:
         print(f"[CIPO Patents]   Reading {ipc_path.name} ...")
-        ipc_df = _read_pipe_csv(ipc_path)
+        ipc_df = _read_pipe_csv(ipc_path, nrows=nrows)
         if ipc_df is not None:
             # Match the same key type PT_main used to avoid cross-space joins
             if "patent" in pn_col.lower():
@@ -564,7 +569,7 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
     return records
 
 
-def load_cipo_trademarks(trademark_dir: str, sectors: list[str]) -> list[dict]:
+def load_cipo_trademarks(trademark_dir: str, sectors: list[str], nrows: int | None = None) -> list[dict]:
     """
     Loads CIPO IP Horizons bulk trademark data from a directory containing:
       TM_application_main*.csv    – application metadata and Nice class
@@ -596,7 +601,7 @@ def load_cipo_trademarks(trademark_dir: str, sectors: list[str]) -> list[dict]:
 
     # ── Read TM_application_main ──────────────────────────────────────────────
     print(f"[CIPO Trademarks]   Reading {main_path.name} ...")
-    main_df = _read_pipe_csv(main_path)
+    main_df = _read_pipe_csv(main_path, nrows=nrows)
     if main_df is None or main_df.empty:
         print("[CIPO Trademarks] Failed to read TM_application_main file.")
         return []
@@ -622,7 +627,7 @@ def load_cipo_trademarks(trademark_dir: str, sectors: list[str]) -> list[dict]:
     # TM_applicant_classification.csv with one row per (application, Nice class).
     if nice_col is None and class_path:
         print(f"[CIPO Trademarks]   No Nice class column in main; trying {class_path.name} ...")
-        class_df = _read_pipe_csv(class_path)
+        class_df = _read_pipe_csv(class_path, nrows=nrows)
         if class_df is not None:
             c_app_col  = _find_col_substr(class_df, "application number")
             c_nice_col = (_find_col_substr(class_df, "nice class") or
@@ -659,7 +664,7 @@ def load_cipo_trademarks(trademark_dir: str, sectors: list[str]) -> list[dict]:
 
     if party_path:
         print(f"[CIPO Trademarks]   Reading {party_path.name} ...")
-        party_df = _read_pipe_csv(party_path)
+        party_df = _read_pipe_csv(party_path, nrows=nrows)
         if party_df is not None:
             p_app_col   = _find_col_substr(party_df, "application number")
             p_name_col  = _find_col_substr(party_df, "party name")
@@ -814,7 +819,7 @@ def load_wipo_export(export_path: str, sectors: list[str]) -> list[dict]:
     return records
 
 
-def fetch_tsx_listed_companies(tsx_file: str | None, sectors: list[str]) -> list[dict]:
+def fetch_tsx_listed_companies(tsx_file: str | None, sectors: list[str], nrows: int | None = None) -> list[dict]:
     """
     Loads the TSX/TSXV current listed-issuers file.
 
@@ -843,7 +848,8 @@ def fetch_tsx_listed_companies(tsx_file: str | None, sectors: list[str]) -> list
     tsx_path = str(tsx_file)
     try:
         if tsx_path.lower().endswith(".txt"):
-            df = pd.read_csv(tsx_path, sep=None, engine="python", on_bad_lines="skip")
+            df = pd.read_csv(tsx_path, sep=None, engine="python", on_bad_lines="skip",
+                             **({"nrows": nrows} if nrows else {}))
         else:
             # The TMX xlsx has 3-4 disclaimer rows before the real header.
             # Scan the first 10 rows to find the one that looks like a header
@@ -855,7 +861,8 @@ def fetch_tsx_listed_companies(tsx_file: str | None, sectors: list[str]) -> list
                 if row.astype(str).str.contains("Co_ID", case=False, na=False).any():
                     header_row = int(i)
                     break
-            df = pd.read_excel(tsx_path, header=header_row)
+            df = pd.read_excel(tsx_path, header=header_row,
+                               **({"nrows": nrows} if nrows else {}))
     except Exception as e:
         print(f"[TSX Listings] FAILED to load: {e}")
         return []
@@ -1286,7 +1293,14 @@ def main():
     parser.add_argument("--litigation-cluster-min-size", type=int, default=3,
                          help="Minimum number of same-sector cases within the window to count as a cluster. Default 3.")
     parser.add_argument("--output", default="prospects.xlsx", help="Output .xlsx path")
+    parser.add_argument("--nrows", type=int, default=None,
+                         help="Read only the first N rows from each source file. "
+                              "Use for fast column-detection testing (e.g. --nrows 2000). "
+                              "Results will be incomplete but column names and type codes "
+                              "will be validated immediately.")
     args = parser.parse_args()
+    if args.nrows:
+        print(f"[DRY RUN] --nrows {args.nrows}: reading only first {args.nrows} rows per file.")
 
     if not any([args.patent_dir, args.trademark_dir, args.wipo_export, args.tsx_file]):
         print("No input files given -- attempting TSX auto-download only.")
@@ -1295,12 +1309,12 @@ def main():
 
     all_records = []
     if args.patent_dir:
-        all_records += load_cipo_patents(args.patent_dir, args.sectors)
+        all_records += load_cipo_patents(args.patent_dir, args.sectors, nrows=args.nrows)
     else:
         print("[CIPO Patents] Skipped (no --patent-dir given)")
 
     if args.trademark_dir:
-        all_records += load_cipo_trademarks(args.trademark_dir, args.sectors)
+        all_records += load_cipo_trademarks(args.trademark_dir, args.sectors, nrows=args.nrows)
     else:
         print("[CIPO Trademarks] Skipped (no --trademark-dir given)")
 
@@ -1309,7 +1323,7 @@ def main():
     else:
         print("[WIPO PATENTSCOPE export] Skipped (no --wipo-export given)")
 
-    all_records += fetch_tsx_listed_companies(args.tsx_file, args.sectors)
+    all_records += fetch_tsx_listed_companies(args.tsx_file, args.sectors, nrows=args.nrows)
 
     print(f"\nTotal raw matching records across all sources: {len(all_records)}")
     result_df = consolidate(all_records, fuzzy_threshold=args.fuzzy_threshold)
