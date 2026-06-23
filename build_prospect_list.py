@@ -353,7 +353,15 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
               f"All columns: {list(main_df.columns)}")
         return []
 
-    print(f"[CIPO Patents]   Key column: {pn_col!r}  Title column: {title_col!r}")
+    # Also try to grab an applicant/owner name directly from PT_main as a fallback
+    # for when PT_interested_party is missing or its type codes are unrecognized.
+    main_name_col = (_find_col_substr(main_df, "applicant name") or
+                     _find_col_substr(main_df, "assignee name") or
+                     _find_col_substr(main_df, "owner name") or
+                     _find_col_substr(main_df, "assignee"))
+
+    print(f"[CIPO Patents]   Key column: {pn_col!r}  Title column: {title_col!r}  "
+          f"PT_main name fallback: {main_name_col!r}")
     main_df["_pn"] = main_df[pn_col].astype(str).str.strip()
     print(f"[CIPO Patents]   {len(main_df):,} patents in PT_main.")
 
@@ -375,10 +383,11 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
             else:
                 p_pn_col = (_find_col_substr(party_df, "application number") or
                              _find_col_substr(party_df, "patent number"))
+            # No bare "name" fallback -- it matches "First Name", "Last Name",
+            # "Agent Name", etc., any of which precede the real party-name column.
             p_name_col = (_find_col_substr(party_df, "interested party name") or
                            _find_col_substr(party_df, "party name") or
-                           _find_col_substr(party_df, "applicant name") or
-                           _find_col_substr(party_df, "name"))
+                           _find_col_substr(party_df, "applicant name"))
             p_type_col = (_find_col_substr(party_df, "interested party type code") or
                            _find_col_substr(party_df, "interested party type") or
                            _find_col_substr(party_df, "party type code") or
@@ -472,6 +481,16 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
                     work[i_sub_col].astype(str).str.strip()
                 ).str.upper()
                 ipc_flat = work[["_pn", "ipc4"]].dropna()
+                # Validate: a well-formed IPC4 code is exactly 4 chars
+                # (1 letter A-H, 2 digits, 1 letter). Garbage values mean a wrong
+                # column was used for section or subclass.
+                valid_ipc4 = ipc_flat["ipc4"].str.match(r"^[A-H]\d{2}[A-Z]$", na=False)
+                if not valid_ipc4.all():
+                    bad_n = (~valid_ipc4).sum()
+                    bad_sample = ipc_flat.loc[~valid_ipc4, "ipc4"].head(3).tolist()
+                    print(f"[CIPO Patents]   WARNING: {bad_n:,} malformed IPC4 codes discarded "
+                          f"(section/subclass column may be wrong). Sample: {bad_sample}")
+                    ipc_flat = ipc_flat[valid_ipc4]
                 print(f"[CIPO Patents]   {len(ipc_flat):,} IPC-classification rows loaded. "
                       f"Sample codes: {ipc_flat['ipc4'].value_counts().head(5).index.tolist()}")
             else:
@@ -510,6 +529,21 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
     sector_df = pd.concat(sector_frames).drop_duplicates()
     sector_df["owner_name"] = sector_df["_pn"].map(owner_s)
     sector_df["agent_name"] = sector_df["_pn"].map(agent_s)
+
+    # If party file was missing or type codes unrecognized, owner_s is empty and
+    # every row maps to NaN.  Fall back to a name column in PT_main if available
+    # rather than silently returning 0 results.
+    if sector_df["owner_name"].isna().all() and main_name_col:
+        print(f"[CIPO Patents]   owner_s is empty; falling back to {main_name_col!r} "
+              f"from PT_main for company names.")
+        main_name_s = (main_df[["_pn", main_name_col]]
+                       .dropna(subset=[main_name_col])
+                       .drop_duplicates(subset=["_pn"])
+                       .set_index("_pn")[main_name_col]
+                       .astype(str).str.strip())
+        main_name_s = main_name_s[~main_name_s.isin(["nan", "None", ""])]
+        sector_df["owner_name"] = sector_df["_pn"].map(main_name_s)
+
     sector_df = sector_df.dropna(subset=["owner_name"])
 
     records = []
@@ -569,7 +603,11 @@ def load_cipo_trademarks(trademark_dir: str, sectors: list[str]) -> list[dict]:
 
     app_col  = _find_col_substr(main_df, "application number")
     nice_col = _find_col_substr(main_df, "nice classification code", "nice class")
-    text_col = _find_col_substr(main_df, "mark description", "description", "title")
+    # Priority split: passing all three to one call returns the first column in file
+    # order containing any substring -- "Status Description" beats "Mark Description".
+    text_col = (_find_col_substr(main_df, "mark description") or
+                _find_col_substr(main_df, "description") or
+                _find_col_substr(main_df, "title"))
 
     if not app_col:
         print(f"[CIPO Trademarks] Could not find application-number column. "
@@ -831,10 +869,16 @@ def fetch_tsx_listed_companies(tsx_file: str | None, sectors: list[str]) -> list
                 _find_col_substr(df, "issuer") or
                 _find_col_substr(df, "company name") or
                 _find_col_substr(df, "name"))
-    sector_col = _find_col_substr(df, "sector") or find_column(df, "sector")
+    sector_col = (_find_col_substr(df, "sector") or
+                  _find_col_substr(df, "industry") or
+                  find_column(df, "sector"))
 
     if not name_col:
         print(f"[TSX Listings] Could not find a company-name column among: {list(df.columns[:15])}")
+        return []
+    if not sector_col:
+        print(f"[TSX Listings] Could not find a sector column -- cannot filter by sector. "
+              f"Columns seen: {list(df.columns[:15])}. Skipping TSX source.")
         return []
 
     records = []
