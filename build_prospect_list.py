@@ -263,9 +263,11 @@ def normalize_name(name: str) -> str:
         return ""
     s = name.lower()
     s = re.sub(r"[.,]", "", s)
+    # \bs\.a\.\b is listed last but dots were removed above, so "S.A." → "SA".
+    # Include \bsa\b to catch the post-dot-removal form.
     suffixes = [r"\binc\b", r"\bincorporated\b", r"\bltd\b", r"\blimited\b",
                 r"\bcorp\b", r"\bcorporation\b", r"\bllc\b", r"\bllp\b",
-                r"\bco\b", r"\bcompany\b", r"\bplc\b", r"\bs\.a\.\b"]
+                r"\bco\b", r"\bcompany\b", r"\bplc\b", r"\bsa\b"]
     for suf in suffixes:
         s = re.sub(suf, "", s)
     s = re.sub(r"[^a-z0-9 ]", "", s)
@@ -436,21 +438,25 @@ def load_cipo_patents(patent_dir: str, sectors: list[str]) -> list[dict]:
         print(f"[CIPO Patents]   Reading {ipc_path.name} ...")
         ipc_df = _read_pipe_csv(ipc_path)
         if ipc_df is not None:
-            i_pn_col  = (_find_col_substr(ipc_df, "patent number") or
-                          _find_col_substr(ipc_df, "application number"))
+            # Match the same key type PT_main used to avoid cross-space joins
+            if "patent" in pn_col.lower():
+                i_pn_col = (_find_col_substr(ipc_df, "patent number") or
+                             _find_col_substr(ipc_df, "application number"))
+            else:
+                i_pn_col = (_find_col_substr(ipc_df, "application number") or
+                             _find_col_substr(ipc_df, "patent number"))
+            # Bare "section" and "subclass" are intentionally omitted: they are
+            # substrings of description columns ("Section Description", "Subclass
+            # Description") and would feed text into the IPC4 reconstruction,
+            # producing garbage codes that match nothing.
             i_sec_col = (_find_col_substr(ipc_df, "ipc section code") or
                           _find_col_substr(ipc_df, "ipc section") or
-                          _find_col_substr(ipc_df, "section code") or
-                          _find_col_substr(ipc_df, "section"))
+                          _find_col_substr(ipc_df, "section code"))
             i_cls_col = (_find_col_substr(ipc_df, "ipc class code") or
                           _find_col_substr(ipc_df, "ipc class"))
-            # NOTE: do NOT fall back to bare "class code" -- it is a substring of
-            # "Subclass Code", which would assign the subclass letter to i_cls_col
-            # and make pd.to_numeric return all NaN, emptying ipc_flat.
             i_sub_col = (_find_col_substr(ipc_df, "ipc subclass code") or
                           _find_col_substr(ipc_df, "ipc subclass") or
-                          _find_col_substr(ipc_df, "subclass code") or
-                          _find_col_substr(ipc_df, "subclass"))
+                          _find_col_substr(ipc_df, "subclass code"))
 
             print(f"[CIPO Patents]   IPC cols: pn={i_pn_col!r} sec={i_sec_col!r} "
                   f"cls={i_cls_col!r} sub={i_sub_col!r}")
@@ -586,13 +592,17 @@ def load_cipo_trademarks(trademark_dir: str, sectors: list[str]) -> list[dict]:
                            _find_col_substr(class_df, "class code") or
                            _find_col_substr(class_df, "class number"))
             if c_app_col and c_nice_col:
+                # Strip the key BEFORE groupby -- unstripped trailing spaces create
+                # separate groups ("12345 " vs "12345") that survive the groupby and
+                # produce duplicate _app_cls values, exploding the merge downstream.
+                class_df = class_df.copy()
+                class_df[c_app_col] = class_df[c_app_col].astype(str).str.strip()
                 nice_agg = (class_df[[c_app_col, c_nice_col]]
                             .dropna(subset=[c_nice_col])
                             .groupby(c_app_col)[c_nice_col]
                             .apply(lambda vals: " ".join(vals.astype(str)))
                             .reset_index()
                             .rename(columns={c_app_col: "_app_cls", c_nice_col: "_nice_joined"}))
-                nice_agg["_app_cls"] = nice_agg["_app_cls"].astype(str).str.strip()
                 main_df = main_df.merge(nice_agg, left_on="_app", right_on="_app_cls", how="left")
                 main_df.drop(columns=["_app_cls"], inplace=True, errors="ignore")
                 nice_col = "_nice_joined"
@@ -814,7 +824,13 @@ def fetch_tsx_listed_companies(tsx_file: str | None, sectors: list[str]) -> list
 
     # The real column names are in the header row; find name and sector columns
     # by substring matching since TMX's exact column names shift between releases.
-    name_col   = _find_col_substr(df, "name", "issuer") or find_column(df, "name")
+    # Search from most-specific to least: "issuer name" → "issuer" → "company name" → "name".
+    # Passing "name" + "issuer" to one _find_col_substr call returns the first column in
+    # file order containing either substring — "Exchange Name" would win over "Issuer Name".
+    name_col = (_find_col_substr(df, "issuer name") or
+                _find_col_substr(df, "issuer") or
+                _find_col_substr(df, "company name") or
+                _find_col_substr(df, "name"))
     sector_col = _find_col_substr(df, "sector") or find_column(df, "sector")
 
     if not name_col:
@@ -934,8 +950,14 @@ def consolidate(records: list[dict], fuzzy_threshold: int = 90) -> pd.DataFrame:
 
 
 def write_output(df: pd.DataFrame, output_path: str) -> None:
-    from openpyxl.styles import Font, Alignment, PatternFill
-    from openpyxl.utils import get_column_letter
+    try:
+        from openpyxl.styles import Font, Alignment, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        csv_path = str(output_path).rsplit(".", 1)[0] + ".csv"
+        df.to_csv(csv_path, index=False)
+        print(f"\nopenpyxl not installed -- saved {len(df)} companies to {csv_path} (CSV fallback)")
+        return
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Prospects")
